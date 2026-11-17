@@ -453,10 +453,9 @@ jobs:
           if-no-files-found: error
 
   # ================= Linux arm64：deb（原生 arm64 runner，无需交叉编译） =================
-  # 单独一个覆盖配置的原因：tauri.linux.conf.json 的 deb Depends 里有
-  # intel-media-va-driver，Ubuntu 22.04 只为它出了 amd64/i386 包
-  # （https://packages.ubuntu.com/jammy/intel-media-va-driver），
-  # arm64 的 deb 若带上它，apt 会直接报「依赖关系无法满足」。
+  # 依赖不再按架构分叉：可选解码插件与 Intel VA 驱动都在 tauri.linux.conf.json 的
+  # Recommends 里，apt 装得上就装，装不上（例如 arm64 没有 intel-media-va-driver、
+  # 或系统里 ffmpeg 被 PPA 换过导致 gstreamer1.0-libav 依赖不满足）也不会卡住安装。
   linux-arm64:
     name: Linux arm64 (deb)
     # ubuntu-22.04-arm：GitHub 公共仓库免费的原生 arm64 runner。
@@ -513,10 +512,9 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      # 覆盖配置在 tauri.linux.conf.json 之后合并（RFC 7396，数组整体替换），
-      # 所以这里的 depends 会完整取代 base 里的列表。
+      # 依赖统一走 tauri.linux.conf.json（arm64 / amd64 共用一份），无需覆盖配置
       - name: 构建（deb，arm64）
-        run: pnpm tauri build --config "$GITHUB_WORKSPACE/src-tauri/tauri.linux-arm64.conf.json"
+        run: pnpm tauri build
 
       - name: 收集产物并校验架构
         shell: bash
@@ -531,6 +529,7 @@ jobs:
           [ "$ARCH" = "arm64" ] || { echo "::error::产物架构是 $ARCH，不是 arm64"; exit 1; }
           DEPS="$(dpkg-deb -f "$DEB" Depends)"
           echo "Depends: $DEPS"
+          echo "Recommends: $(dpkg-deb -f "$DEB" Recommends)"
           case "$DEPS" in
             *intel-media-va-driver*) echo "::error::arm64 包不应依赖 intel-media-va-driver"; exit 1 ;;
           esac
