@@ -9,10 +9,10 @@ on:
   workflow_dispatch:
     inputs:
       platforms:
-        description: "构建范围：check 只查编译不出包；all 四平台；选单个只出那一个"
+        description: "构建范围：check 只查编译不出包；all 四平台；选单个只出那一个（linux 含 amd64 + arm64）"
         type: choice
         default: all
-        options: [all, android-arm64, android, linux, windows, macos, ios, check]
+        options: [all, android-arm64, android, linux, linux-arm64, windows, macos, ios, check]
       quick:
         description: "quick 编译：thin LTO + 4 个 codegen 单元，快一倍，体积大几 MB"
         type: boolean
@@ -452,6 +452,96 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
 
+  # ================= Linux arm64：deb（原生 arm64 runner，无需交叉编译） =================
+  # 单独一个覆盖配置的原因：tauri.linux.conf.json 的 deb Depends 里有
+  # intel-media-va-driver，Ubuntu 22.04 只为它出了 amd64/i386 包
+  # （https://packages.ubuntu.com/jammy/intel-media-va-driver），
+  # arm64 的 deb 若带上它，apt 会直接报「依赖关系无法满足」。
+  linux-arm64:
+    name: Linux arm64 (deb)
+    # ubuntu-22.04-arm：GitHub 公共仓库免费的原生 arm64 runner。
+    # 私有仓库没有这个标签，需要 arm64 larger runner 或自建 arm64 runner。
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 60
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platforms == 'all' || inputs.platforms == 'linux' || inputs.platforms == 'linux-arm64' }}
+    env:
+      CARGO_PROFILE_RELEASE_LTO: ${{ inputs.quick && 'thin' || 'true' }}
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ inputs.quick && '4' || '1' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 版本号对齐 tag
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            V="${{ inputs.tag }}"
+            V="${V#v}"
+          else
+            V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          fi
+          node scripts/set-version.mjs "$V"
+          CODE="$(node -p "require('./src-tauri/tauri.conf.json').bundle.android.versionCode")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "versionCode=$CODE" >> "$GITHUB_OUTPUT"
+          echo "versionName=$V  versionCode=$CODE"
+
+      # 22.04 的 arm64 源里同样有 libwebkit2gtk-4.1-dev / libgtk-3-dev，直接原生编译
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf build-essential curl wget file libssl-dev libxdo-dev
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2.9.3
+        continue-on-error: true
+        timeout-minutes: 8
+        with:
+          workspaces: src-tauri -> target
+          key: linux-arm64
+
+      - run: pnpm install --frozen-lockfile
+
+      # 覆盖配置在 tauri.linux.conf.json 之后合并（RFC 7396，数组整体替换），
+      # 所以这里的 depends 会完整取代 base 里的列表。
+      - name: 构建（deb，arm64）
+        run: pnpm tauri build --config "$GITHUB_WORKSPACE/src-tauri/tauri.linux-arm64.conf.json"
+
+      - name: 收集产物并校验架构
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          DEB="artifacts/HGhubX_${{ steps.ver.outputs.version }}_arm64.deb"
+          cp src-tauri/target/release/bundle/deb/*.deb "$DEB"
+          ARCH="$(dpkg-deb -f "$DEB" Architecture)"
+          echo "Architecture: $ARCH"
+          # 跑在 arm64 runner 上却出 amd64 包，说明构建目标没走对，直接失败
+          [ "$ARCH" = "arm64" ] || { echo "::error::产物架构是 $ARCH，不是 arm64"; exit 1; }
+          DEPS="$(dpkg-deb -f "$DEB" Depends)"
+          echo "Depends: $DEPS"
+          case "$DEPS" in
+            *intel-media-va-driver*) echo "::error::arm64 包不应依赖 intel-media-va-driver"; exit 1 ;;
+          esac
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-arm64
+          path: artifacts/*
+          if-no-files-found: error
+
   # ================= 只查编译：不出包，最快拿到「过 / 不过」 =================
   check:
     name: 编译检查（tsc + cargo check + 单测）
@@ -504,7 +594,7 @@ jobs:
   # ================= 发布 =================
   release:
     name: Publish GitHub Release
-    needs: [windows, android, macos, linux, ios]
+    needs: [windows, android, macos, linux, linux-arm64, ios]
     # always()：iOS 失败时不能把整包卡住，但成功时要等它的 ipa 一起发
     if: >-
       always() &&
